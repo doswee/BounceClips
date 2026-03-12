@@ -1,135 +1,207 @@
 import grpc
 import json
+import os
+import re
+import sys
 import threading
-import logging
 
-# Import the generated gRPC stubs
-# Assuming you ran the protoc command in the previous step
-try:
-    from proto import PTSL_pb2
-    from proto import PTSL_pb2_grpc
-except ImportError:
-    print("Error: gRPC stubs not found. Please ensure you ran the compilation command in the 'proto' folder.")
+# Ensure the proto folder is in the path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, 'proto'))
 
-# Set up logging for debugging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("PTSLClient")
+import PTSL_pb2
+import PTSL_pb2_grpc
 
 class PTSLClient:
     def __init__(self, address="localhost:31416"):
-        """
-        Initializes the connection to the Pro Tools Scripting SDK.
-        Default address is localhost:31416.
-        """
         self.address = address
         self.channel = grpc.insecure_channel(self.address)
         self.stub = PTSL_pb2_grpc.PTSLStub(self.channel)
-        
         self.session_id = ""
-        self.lock = threading.Lock()
-        
-        logger.info(f"Initialized PTSL Client on {self.address}")
+        self.lock = threading.RLock()
 
-    def register_connection(self, company_name: str, app_name: str) -> bool:
-        """
-        Performs the mandatory handshake with Pro Tools.
-        Sets the session_id required for all future commands.
-        """
-        # 1. Prepare the JSON body for registration
-        registration_dict = {
-            "company_name": company_name,
+    def send_command(self, command_id, request_body=None):
+        with self.lock:
+            if not self.session_id and command_id != PTSL_pb2.CId_RegisterConnection:
+                self.register()
+
+            request = PTSL_pb2.Request()
+            request.header.command = command_id
+            request.header.version = 1
+            request.header.session_id = self.session_id
+            if request_body:
+                request.request_body_json = json.dumps(request_body)
+
+            try:
+                response = self.stub.SendGrpcRequest(request)
+                return {
+                    "status": response.header.status,
+                    "data": json.loads(response.response_body_json or "{}"),
+                    "error": response.response_error_json
+                }
+            except Exception as e:
+                print(f"PTSL ERROR: {e}")
+                return {"status": -1, "data": {}, "error": str(e)}
+
+    def register(self, app_name="RogueWaves"):
+        res = self.send_command(PTSL_pb2.CId_RegisterConnection, {
+            "company_name": "LocalUser",
             "application_name": app_name
-        }
-        
-        # 2. Construct the Request object
-        # Note: CommandId 1 is typically RegisterConnection
-        # We use the enum from the generated proto file
-        request = PTSL_pb2.Request(
-            header=PTSL_pb2.RequestHeader(session_id=""), # Empty for registration
-            command=PTSL_pb2.CId_RegisterConnection,
-            body=json.dumps(registration_dict)
-        )
-
-        try:
-            with self.lock:
-                response = self.stub.SendRequest(request)
-            
-            if response.status == PTSL_pb2.Completed:
-                # The session_id is returned inside the JSON response body
-                response_body = json.loads(response.response_body)
-                self.session_id = response_body.get("session_id", "")
-                
-                if self.session_id:
-                    logger.info(f"Successfully registered with Pro Tools. Session ID: {self.session_id}")
-                    return True
-                else:
-                    logger.error("Registration succeeded but no session_id was returned.")
-            else:
-                logger.error(f"Registration failed with status: {response.status}")
-                logger.error(f"Error Detail: {response.response_error}")
-                
-        except grpc.RpcError as e:
-            logger.error(f"gRPC Connection Error during registration: {e.details()}")
-        
+        })
+        if res["status"] == 3:
+            self.session_id = res["data"].get("session_id", "")
+            return True
         return False
 
-    def send_command(self, command_id, body_dict=None) -> dict:
+    def get_session_name(self):
+        res = self.send_command(PTSL_pb2.CId_GetSessionName)
+        return res.get("data", {}).get("session_name")
+
+    def get_available_sources(self):
+        sources = []
+        for p_type in ["Output", "Bus"]:
+            res = self.send_command(PTSL_pb2.CId_GetExportMixSourceList, {"type": p_type})
+            names = res.get("data", {}).get("source_list", [])
+            for n in names:
+                # Store the UI type for the bounce request later
+                sources.append({"name": n, "type": p_type})
+        return sources
+
+    # --- YOUR WORKING LOGIC HELPERS ---
+    def _tc_to_val(self, tc):
+        if not tc: return 0.0
+        clean = tc.replace(':', '').replace(';', '')
+        return float(clean)
+
+    def _clean_clip_name(self, name):
         """
-        Generic method to send any command to Pro Tools.
-        Automatically handles the RequestHeader and JSON serialization.
+        Cleans the clip name by:
+        1. Stripping leading Event IDs (e.g., '22      Clip' -> 'Clip')
+        2. Stripping Tab characters and extra whitespace
+        3. Removing .L/.R/stereo suffixes
         """
-        if not self.session_id and command_id != PTSL_pb2.CId_RegisterConnection:
-            raise Exception("Client is not registered. Call register_connection() first.")
+        # Replace tabs with spaces and trim
+        name = name.replace('\t', ' ').strip()
+        
+        # Aggressively remove leading digits followed by whitespace
+        # This fixes the "9 characters before it" issue (the Event ID column)
+        name = re.sub(r'^\d+\s+', '', name)
+        
+        # Remove .L, .R, _L, _R, .1, .2 etc from stereo legs
+        name = re.sub(r"(\.[LRCLSsrfe\d]+|_L|_R)$", "", name, flags=re.IGNORECASE)
+        
+        return name.strip()
 
-        # Prepare body
-        body_json = json.dumps(body_dict) if body_dict else ""
+    def get_selected_clips_details(self):
+        if not self.session_id: self.register()
 
-        # Construct request with the active session_id
-        request = PTSL_pb2.Request(
-            header=PTSL_pb2.RequestHeader(session_id=self.session_id),
-            command=command_id,
-            body=body_json
-        )
+        # 1. Get current selection from Pro Tools
+        ts_res = self.send_command(PTSL_pb2.CId_GetEditSelection, {"location_type": "TLType_TimeCode"})
+        sel_in = ts_res["data"].get("in_time", "00:00:00:00")
+        sel_out = ts_res["data"].get("out_time", "00:00:00:00")
+        
+        sel_in_val = self._tc_to_val(sel_in)
+        sel_out_val = self._tc_to_val(sel_out)
 
-        try:
-            with self.lock:
-                response = self.stub.SendRequest(request)
+        # 2. Export Session Info
+        esi_res = self.send_command(PTSL_pb2.CId_ExportSessionInfoAsText, {
+            "include_clip_list": True,
+            "track_list_type": "SelectedTracksOnly",
+            "output_type": "ESI_String",
+            "text_as_file_format": "UTF8",
+            "track_offset_options": "TimeCode",
+            "show_sub_frames": True 
+        })
+        
+        text = esi_res.get("data", {}).get("session_info", "")
+        if not text: return []
+
+        if "T R A C K  L I S T" not in text: return []
+        track_section_master = text.split("T R A C K  L I S T")[-1]
+        track_blocks = re.split(r'TRACK NAME:\s+', track_section_master)
+        
+        found_clips = []
+        seen_identities = set()
+
+        # This regex captures the line: digit(s) -> whitespace -> Name+Index -> Timecodes
+        # We clean the "Name+Index" part in the _clean_clip_name function
+        clip_pattern = re.compile(r"^\d+\s+(.*?)\s+([\d:;.]+)\s+([\d:;.]+)", re.MULTILINE)
+
+        for block in track_blocks[1:]:
+            lines = block.splitlines()
+            if not lines: continue
             
-            # Parse the response body JSON
-            result_data = {}
-            if response.response_body:
-                result_data = json.loads(response.response_body)
+            raw_track_name = lines[0].strip()
+            track_name_for_solo = re.sub(r'\s*\(.*?\)\s*$', '', raw_track_name).strip()
 
-            # Return a clean dictionary with status and data
-            return {
-                "status": response.status, # Use PTSL_pb2.Completed/Failed to check
-                "data": result_data,
-                "error": response.response_error
-            }
+            clips_in_block = clip_pattern.findall(block)
+            
+            for name, start_tc, end_tc in clips_in_block:
+                try:
+                    clip_start_val = self._tc_to_val(start_tc)
+                    clip_end_val = self._tc_to_val(end_tc)
+                    
+                    if clip_start_val >= (sel_in_val - 0.01) and clip_end_val <= (sel_out_val + 0.01):
+                        # CLEANING HAPPENS HERE
+                        clean_name = self._clean_clip_name(name)
+                        
+                        identity = (clean_name, start_tc, end_tc, track_name_for_solo)
+                        if identity not in seen_identities:
+                            seen_identities.add(identity)
+                            found_clips.append({
+                                "name": clean_name,
+                                "start": start_tc,
+                                "end": end_tc,
+                                "track": track_name_for_solo
+                            })
+                except ValueError:
+                    continue
 
-        except grpc.RpcError as e:
-            logger.error(f"gRPC Error during command {command_id}: {e.details()}")
-            return {"status": PTSL_pb2.Failed, "data": {}, "error": str(e.details())}
+        return found_clips
 
-    def close(self):
-        """Closes the gRPC channel."""
-        self.channel.close()
-        logger.info("PTSL Connection Closed.")
+    def perform_batch_bounce(self, clips, settings):
+        # Group clips by track
+        track_groups = {}
+        for c in clips:
+            track_groups.setdefault(c["track"], []).append(c)
 
-# --- TEST BLOCK ---
-# This allows you to run this file alone to test the connection
-if __name__ == "__main__":
-    client = PTSLClient()
-    # Replace with your details
-    success = client.register_connection("Rogue Waves", "Bouncey")
-    
-    if success:
-        print("HANDSHAKE SUCCESSFUL!")
-        # Test a simple command: Get the track list
-        # Note: In your actual app, you'll use the enum names from PTSL_pb2
-        response = client.send_command(PTSL_pb2.CId_GetTrackList)
-        print(f"Current Tracks: {response['data']}")
-    else:
-        print("HANDSHAKE FAILED. Is Pro Tools open and is the Scripting SDK enabled?")
-    
-    client.close()
+        for track, t_clips in track_groups.items():
+            print(f"BOUNCING TRACK: {track}")
+            # Solo the track
+            self.send_command(PTSL_pb2.CId_SetTrackSoloState, {"track_names": [track], "enabled": True})
+            
+            try:
+                for clip in t_clips:
+                    # Select the clip
+                    self.send_command(PTSL_pb2.CId_SetTimelineSelection, {
+                        "in_time": clip["start"], 
+                        "out_time": clip["end"],
+                        "location_type": "TLType_TimeCode"
+                    })
+
+                    # Bounce
+                    bounce_req = {
+                        "file_name": f"{settings['prefix']}{clip['name']}{settings['suffix']}",
+                        "file_type": settings['file_type'],
+                        "offline_bounce": "TBool_True",
+                        "audio_info": {
+                            "bit_depth": f"BDepth_{settings['bit_depth']}" if settings['bit_depth'] != "32" else "BDepth_32Float",
+                            "sample_rate": f"SRate_{settings['sample_rate']}",
+                            "export_format": "EFormat_Interleaved",
+                            "delivery_format": "EMDFormat_SingleFile"
+                        },
+                        "location_info": {
+                            "file_destination": "EMFDestination_Directory" if settings['custom_path'] else "EMFDestination_SessionFolder",
+                            "directory": settings.get('custom_path', "")
+                        },
+                        "mix_source_list": [{
+                            "source_type": "EMSType_Output" if settings['source_type'] == "Output" else "EMSType_Bus",
+                            "name": settings['source_name']
+                        }]
+                    }
+                    self.send_command(PTSL_pb2.CId_ExportMix, bounce_req)
+            finally:
+                # Unsolo
+                self.send_command(PTSL_pb2.CId_SetTrackSoloState, {"track_names": [track], "enabled": False})
+        
+        return True
