@@ -24,14 +24,12 @@ class PTSLClient:
         with self.lock:
             if not self.session_id and command_id != PTSL_pb2.CId_RegisterConnection:
                 self.register()
-
             request = PTSL_pb2.Request()
             request.header.command = command_id
             request.header.version = 1
             request.header.session_id = self.session_id
             if request_body:
                 request.request_body_json = json.dumps(request_body)
-
             try:
                 response = self.stub.SendGrpcRequest(request)
                 return {
@@ -40,14 +38,10 @@ class PTSLClient:
                     "error": response.response_error_json
                 }
             except Exception as e:
-                print(f"PTSL ERROR: {e}")
                 return {"status": -1, "data": {}, "error": str(e)}
 
     def register(self, app_name="RogueWaves"):
-        res = self.send_command(PTSL_pb2.CId_RegisterConnection, {
-            "company_name": "LocalUser",
-            "application_name": app_name
-        })
+        res = self.send_command(PTSL_pb2.CId_RegisterConnection, {"company_name": "LocalUser", "application_name": app_name})
         if res["status"] == 3:
             self.session_id = res["data"].get("session_id", "")
             return True
@@ -57,151 +51,134 @@ class PTSLClient:
         res = self.send_command(PTSL_pb2.CId_GetSessionName)
         return res.get("data", {}).get("session_name")
 
+    def get_bounced_files_path(self):
+        res = self.send_command(PTSL_pb2.CId_GetSessionPath)
+        path_obj = res.get("data", {}).get("session_path", {})
+        full_ptx_path = path_obj.get("path")
+        if full_ptx_path:
+            return os.path.join(os.path.dirname(full_ptx_path), "Bounced Files")
+        return ""
+
     def get_available_sources(self):
         sources = []
         for p_type in ["Output", "Bus"]:
             res = self.send_command(PTSL_pb2.CId_GetExportMixSourceList, {"type": p_type})
             names = res.get("data", {}).get("source_list", [])
             for n in names:
-                # Store the UI type for the bounce request later
-                sources.append({"name": n, "type": p_type})
+                sources.append({"name": n, "type": "EMSType_Output" if p_type == "Output" else "EMSType_Bus"})
         return sources
 
-    # --- YOUR WORKING LOGIC HELPERS ---
-    def _tc_to_val(self, tc):
-        if not tc: return 0.0
-        clean = tc.replace(':', '').replace(';', '')
-        return float(clean)
+    def _is_fade(self, name):
+        """Identifies if a clip is a Pro Tools generated fade label."""
+        lower_name = name.lower()
+        return any(f in lower_name for f in ["(fade in)", "(fade out)", "(crossfade)"])
 
     def _clean_clip_name(self, name):
-        """
-        Cleans the clip name by:
-        1. Stripping leading Event IDs (e.g., '22      Clip' -> 'Clip')
-        2. Stripping Tab characters and extra whitespace
-        3. Removing .L/.R/stereo suffixes
-        """
-        # Replace tabs with spaces and trim
+        """Cleans Event IDs and stereo suffixes."""
         name = name.replace('\t', ' ').strip()
-        
-        # Aggressively remove leading digits followed by whitespace
-        # This fixes the "9 characters before it" issue (the Event ID column)
+        # Remove Event ID column
         name = re.sub(r'^\d+\s+', '', name)
-        
-        # Remove .L, .R, _L, _R, .1, .2 etc from stereo legs
-        name = re.sub(r"(\.[LRCLSsrfe\d]+|_L|_R)$", "", name, flags=re.IGNORECASE)
-        
+        # Remove stereo legs only if NOT a fade
+        if not self._is_fade(name):
+            name = re.sub(r"(\.[LRCLSsrfe\d]+|_L|_R)$", "", name, flags=re.IGNORECASE)
         return name.strip()
 
     def get_selected_clips_details(self):
-        if not self.session_id: self.register()
+        # 1. Selection in Samples
+        ts_res = self.send_command(PTSL_pb2.CId_GetEditSelection, {"location_type": "TLType_Samples"})
+        sel_in = int(ts_res["data"].get("in_time", "0"))
+        sel_out = int(ts_res["data"].get("out_time", "0"))
 
-        # 1. Get current selection from Pro Tools
-        ts_res = self.send_command(PTSL_pb2.CId_GetEditSelection, {"location_type": "TLType_TimeCode"})
-        sel_in = ts_res["data"].get("in_time", "00:00:00:00")
-        sel_out = ts_res["data"].get("out_time", "00:00:00:00")
-        
-        sel_in_val = self._tc_to_val(sel_in)
-        sel_out_val = self._tc_to_val(sel_out)
-
-        # 2. Export Session Info
+        # 2. Export in Samples
         esi_res = self.send_command(PTSL_pb2.CId_ExportSessionInfoAsText, {
-            "include_clip_list": True,
-            "track_list_type": "SelectedTracksOnly",
-            "output_type": "ESI_String",
-            "text_as_file_format": "UTF8",
-            "track_offset_options": "TimeCode",
-            "show_sub_frames": True 
+            "include_clip_list": True, "track_list_type": "SelectedTracksOnly",
+            "output_type": "ESI_String", "text_as_file_format": "UTF8",
+            "track_offset_options": "Samples" 
         })
         
         text = esi_res.get("data", {}).get("session_info", "")
-        if not text: return []
+        if not text or "T R A C K  L I S T" not in text: return []
 
-        if "T R A C K  L I S T" not in text: return []
-        track_section_master = text.split("T R A C K  L I S T")[-1]
-        track_blocks = re.split(r'TRACK NAME:\s+', track_section_master)
+        track_section = text.split("T R A C K  L I S T")[-1]
+        track_blocks = re.split(r'TRACK NAME:\s+', track_section)
         
         found_clips = []
-        seen_identities = set()
-
-        # This regex captures the line: digit(s) -> whitespace -> Name+Index -> Timecodes
-        # We clean the "Name+Index" part in the _clean_clip_name function
-        clip_pattern = re.compile(r"^\d+\s+(.*?)\s+([\d:;.]+)\s+([\d:;.]+)", re.MULTILINE)
+        seen = set()
+        clip_pattern = re.compile(r"^\d+\s+(.*?)\s+(\d+)\s+(\d+)", re.MULTILINE)
 
         for block in track_blocks[1:]:
             lines = block.splitlines()
             if not lines: continue
-            
-            raw_track_name = lines[0].strip()
-            track_name_for_solo = re.sub(r'\s*\(.*?\)\s*$', '', raw_track_name).strip()
-
-            clips_in_block = clip_pattern.findall(block)
-            
-            for name, start_tc, end_tc in clips_in_block:
-                try:
-                    clip_start_val = self._tc_to_val(start_tc)
-                    clip_end_val = self._tc_to_val(end_tc)
-                    
-                    if clip_start_val >= (sel_in_val - 0.01) and clip_end_val <= (sel_out_val + 0.01):
-                        # CLEANING HAPPENS HERE
-                        clean_name = self._clean_clip_name(name)
-                        
-                        identity = (clean_name, start_tc, end_tc, track_name_for_solo)
-                        if identity not in seen_identities:
-                            seen_identities.add(identity)
-                            found_clips.append({
-                                "name": clean_name,
-                                "start": start_tc,
-                                "end": end_tc,
-                                "track": track_name_for_solo
-                            })
-                except ValueError:
-                    continue
-
+            track_name = re.sub(r'\s*\(.*?\)\s*$', '', lines[0].strip()).strip()
+            for name, start_s, end_s in clip_pattern.findall(block):
+                c_s, c_e = int(start_s), int(end_s)
+                if c_s >= (sel_in - 1) and c_e <= (sel_out + 1):
+                    c_name = self._clean_clip_name(name)
+                    identity = (c_name, c_s, c_e, track_name)
+                    if identity not in seen:
+                        seen.add(identity)
+                        found_clips.append({
+                            "name": c_name, 
+                            "start": str(c_s), "end": str(c_e), 
+                            "start_val": c_s, "end_val": c_e, 
+                            "track": track_name,
+                            "is_fade": self._is_fade(c_name)
+                        })
         return found_clips
 
     def perform_batch_bounce(self, clips, settings):
-        # Group clips by track
+        if not clips: return False
         track_groups = {}
-        for c in clips:
-            track_groups.setdefault(c["track"], []).append(c)
+        for c in clips: track_groups.setdefault(c["track"], []).append(c)
+
+        # Merge Logic with Fade Absorption
+        final_list = []
+        user_wants_merge = settings.get("merge_contiguous", False)
 
         for track, t_clips in track_groups.items():
-            print(f"BOUNCING TRACK: {track}")
-            # Solo the track
-            self.send_command(PTSL_pb2.CId_SetTrackSoloState, {"track_names": [track], "enabled": True})
+            t_clips.sort(key=lambda x: x["start_val"])
+            if not t_clips: continue
             
-            try:
-                for clip in t_clips:
-                    # Select the clip
-                    self.send_command(PTSL_pb2.CId_SetTimelineSelection, {
-                        "in_time": clip["start"], 
-                        "out_time": clip["end"],
-                        "location_type": "TLType_TimeCode"
-                    })
+            curr = t_clips[0].copy()
+            for i in range(1, len(t_clips)):
+                nxt = t_clips[i]
+                
+                # We merge if they touch AND (User wants merge OR it's a fade)
+                should_merge = False
+                if abs(curr["end_val"] - nxt["start_val"]) <= 1:
+                    if user_wants_merge or curr["is_fade"] or nxt["is_fade"]:
+                        should_merge = True
+                
+                if should_merge:
+                    curr["end_val"], curr["end"] = nxt["end_val"], nxt["end"]
+                    # Adopt non-fade name if the current one is just a fade label
+                    if curr["is_fade"] and not nxt["is_fade"]:
+                        curr["name"] = nxt["name"]
+                        curr["is_fade"] = False
+                else:
+                    if not curr["is_fade"]: final_list.append(curr)
+                    curr = nxt.copy()
+            if not curr["is_fade"]: final_list.append(curr)
 
-                    # Bounce
+        # Bouncing
+        file_counter = 1
+        bounce_groups = {}
+        for c in final_list: bounce_groups.setdefault(c["track"], []).append(c)
+
+        for track, b_clips in bounce_groups.items():
+            self.send_command(PTSL_pb2.CId_SetTrackSoloState, {"track_names": [track], "enabled": True})
+            try:
+                for clip in b_clips:
+                    fname = f"{settings['prefix']}{settings['base_name']}_{str(file_counter).zfill(settings['digit_padding'])}{settings['suffix']}" if settings["naming_mode"] == 1 else f"{settings['prefix']}{clip['name']}{settings['suffix']}"
+                    self.send_command(PTSL_pb2.CId_SetTimelineSelection, {"in_time": clip["start"], "out_time": clip["end"], "location_type": "TLType_Samples"})
+                    bit = f"BDepth_{settings['bit_depth']}" if settings['bit_depth'] != "32" else "BDepth_32Float"
                     bounce_req = {
-                        "file_name": f"{settings['prefix']}{clip['name']}{settings['suffix']}",
-                        "file_type": settings['file_type'],
-                        "offline_bounce": "TBool_True",
-                        "audio_info": {
-                            "bit_depth": f"BDepth_{settings['bit_depth']}" if settings['bit_depth'] != "32" else "BDepth_32Float",
-                            "sample_rate": f"SRate_{settings['sample_rate']}",
-                            "export_format": "EFormat_Interleaved",
-                            "delivery_format": "EMDFormat_SingleFile"
-                        },
-                        "location_info": {
-                            "file_destination": "EMFDestination_Directory" if settings['custom_path'] else "EMFDestination_SessionFolder",
-                            "directory": settings.get('custom_path', "")
-                        },
-                        "mix_source_list": [{
-                            "source_type": "EMSType_Output" if settings['source_type'] == "Output" else "EMSType_Bus",
-                            "name": settings['source_name']
-                        }]
+                        "file_name": fname, "file_type": settings['file_type'], "offline_bounce": "TBool_True",
+                        "audio_info": { "bit_depth": bit, "sample_rate": f"SRate_{settings['sample_rate']}", "export_format": "EFormat_Interleaved", "delivery_format": "EMDFormat_SingleFile" },
+                        "location_info": { "file_destination": "EMFDestination_Directory" if settings['custom_path'] else "EMFDestination_SessionFolder", "directory": settings['custom_path'] },
+                        "mix_source_list": [{ "source_type": settings['source_type'], "name": settings['source_name'] }]
                     }
-                    self.send_command(PTSL_pb2.CId_ExportMix, bounce_req)
+                    self.send_command(PTSL_pb2.CId_ExportMix, bounce_req); file_counter += 1
             finally:
-                # Unsolo
                 self.send_command(PTSL_pb2.CId_SetTrackSoloState, {"track_names": [track], "enabled": False})
-        
         return True
